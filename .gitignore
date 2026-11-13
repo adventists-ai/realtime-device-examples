@@ -1,0 +1,4 @@
+.npcid
+*.wav
+__pycache__/
+.env

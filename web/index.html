@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Harness WebSocket demo</title>
+<style>
+body{font:15px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;max-width:720px;margin:40px auto;padding:0 16px;color:#16161a}
+button{font:inherit;padding:8px 18px;border-radius:8px;border:1px solid #3b5bdb;background:#3b5bdb;color:#fff;cursor:pointer}
+button.off{background:#fff;color:#3b5bdb}#state{color:#6b6b76;margin-left:12px}
+#log{margin-top:20px;border-top:1px solid #e4e4e8}#log div{padding:6px 0;border-bottom:1px solid #f0f0f3}.you{color:#6b6b76}
+</style>
+</head>
+<body>
+<h2>Harness · WebSocket · duplex</h2>
+<p>点「开始」后直接说话，可以随时打断。建议戴耳机。<br>Press Start and just talk; interrupt any time. Headphones recommended.</p>
+<button id="btn">开始 / Start</button><span id="state"></span>
+<div id="log"></div>
+<script>
+// ---- 帧格式 / frame format: ##START [type 1B][task_id 8B][seq 4B][payload] ##END
+const AUTH = 1, AUDIO = 2, END = 3, TEXT = 4, STATUS = 5, LISTEN = 8;
+const enc = new TextEncoder(), dec = new TextDecoder();
+const START = enc.encode("##START"), FIN = enc.encode("##END");
+
+function frame(type, payload, taskId = "duplex00", seq = 0) {
+  const head = enc.encode(taskId + String(seq % 10000).padStart(4, "0"));
+  const out = new Uint8Array(START.length + 1 + head.length + payload.length + FIN.length);
+  let o = 0;
+  out.set(START, o); o += START.length;
+  out[o++] = type;
+  out.set(head, o); o += head.length;
+  out.set(payload, o); o += payload.length;
+  out.set(FIN, o);
+  return out;
+}
+
+function indexOf(buf, pat, from) {
+  outer: for (let i = from; i <= buf.length - pat.length; i++) {
+    for (let j = 0; j < pat.length; j++) if (buf[i + j] !== pat[j]) continue outer;
+    return i;
+  }
+  return -1;
+}
+
+let recv = new Uint8Array(0);
+function parse(chunk) {            // 返回完整的帧，半包留到下次 / returns complete frames, keeps partial ones
+  const merged = new Uint8Array(recv.length + chunk.length);
+  merged.set(recv); merged.set(chunk, recv.length); recv = merged;
+  const frames = [];
+  for (;;) {
+    const i = indexOf(recv, START, 0); if (i < 0) break;
+    const j = indexOf(recv, FIN, i + 20); if (j < 0) { recv = recv.slice(i); return frames; }
+    frames.push({ type: recv[i + 7], taskId: dec.decode(recv.slice(i + 8, i + 16)), payload: recv.slice(i + 20, j) });
+    recv = recv.slice(j + FIN.length);
+  }
+  return frames;
+}
+
+// ---- 界面 / UI
+const $ = id => document.getElementById(id);
+function log(text, cls) { const d = document.createElement("div"); d.textContent = text; if (cls) d.className = cls; $("log").prepend(d); }
+function setState(s) { $("state").textContent = s; }
+
+// ---- 音频 / audio (16 kHz mono PCM16 both ways)
+let ctx, ws, mic, node, seq = 0, playAt = 0, pending = new Int16Array(0);
+const FRAME = 960;                // 60 ms @ 16 kHz
+
+function play(bytes) {
+  const pcm = new Int16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength >> 1);
+  const buf = ctx.createBuffer(1, pcm.length, 16000), ch = buf.getChannelData(0);
+  for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
+  const src = ctx.createBufferSource(); src.buffer = buf; src.connect(ctx.destination);
+  playAt = Math.max(playAt, ctx.currentTime + 0.05); src.start(playAt); playAt += buf.duration;
+}
+
+async function startMic() {
+  mic = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 } });
+  const worklet = `class P extends AudioWorkletProcessor{process(i){if(i[0][0])this.port.postMessage(i[0][0]);return true}}registerProcessor("p",P)`;
+  await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([worklet], { type: "application/javascript" })));
+  node = new AudioWorkletNode(ctx, "p");
+  node.port.onmessage = e => {      // 攒够 60 ms 发一帧 / send one frame per 60 ms
+    const f = e.data, add = new Int16Array(f.length);
+    for (let i = 0; i < f.length; i++) add[i] = Math.max(-1, Math.min(1, f[i])) * 32767;
+    const m = new Int16Array(pending.length + add.length); m.set(pending); m.set(add, pending.length); pending = m;
+    while (pending.length >= FRAME && ws && ws.readyState === 1) {
+      ws.send(frame(AUDIO, new Uint8Array(pending.slice(0, FRAME).buffer), "duplex00", seq++));
+      pending = pending.slice(FRAME);
+    }
+  };
+  ctx.createMediaStreamSource(mic).connect(node);
+}
+
+async function start() {
+  setState("连接中… / connecting…");
+  ctx = new AudioContext({ sampleRate: 16000 });
+  // 1) 向自己的后端要令牌（key 不进浏览器）/ ask your backend for a token (the key never reaches the browser)
+  const s = await (await fetch("/api/session", { method: "POST" })).json();
+  // 2) 连 WebSocket，发认证帧 / connect and authenticate
+  ws = new WebSocket(s.ws_url); ws.binaryType = "arraybuffer";
+  ws.onopen = () => ws.send(frame(AUTH, enc.encode(`${s.token}##mode:duplex##format:pcm##input_audio_format:pcm##engine:tag`), "00000000"));
+  ws.onmessage = e => {
+    for (const f of parse(new Uint8Array(e.data))) {
+      if (f.type === AUDIO) { play(f.payload); continue; }
+      const text = dec.decode(f.payload);
+      if (f.type === LISTEN) { setState("在听，请说话 / listening"); startMic(); }       // 3) 收到 LISTEN start 才开麦 / open mic after LISTEN start
+      else if (f.type === TEXT) log("AI: " + text);
+      else if (f.type === STATUS && text.startsWith("##INFO:prompt:")) log("你 / You: " + text.slice(14).trim(), "you");
+      else if (f.type === STATUS && text.startsWith("##ERROR")) log(text);
+    }
+  };
+  ws.onclose = () => { setState("已断开 / disconnected"); stop(); };
+  $("btn").textContent = "结束 / Stop"; $("btn").className = "off";
+}
+
+function stop() {
+  if (ws && ws.readyState === 1) { ws.send(frame(STATUS, enc.encode("##DISCONNECT"), "00000000")); ws.close(); }
+  if (mic) mic.getTracks().forEach(t => t.stop());
+  if (ctx) ctx.close();
+  ws = mic = ctx = null; seq = 0; playAt = 0; pending = new Int16Array(0); recv = new Uint8Array(0);
+  $("btn").textContent = "开始 / Start"; $("btn").className = "";
+}
+
+$("btn").onclick = () => (ws ? stop() : start().catch(e => { setState(String(e)); stop(); }));
+</script>
+</body>
+</html>
