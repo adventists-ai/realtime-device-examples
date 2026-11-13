@@ -180,6 +180,82 @@ class Connection:
             pass
 
 
+# ---------------------------------------------------------------- images (duplex)
+IMAGE_CHUNK = 1012          # 每片最多 1012 字节 / at most 1012 bytes per chunk
+
+
+def image_chunks(jpeg: bytes, image_no: int) -> list[tuple[str, int, bytes]]:
+    """把一张 JPEG 切成上行 IMAGE 帧的分片：同一张图同一个 task_id，seq 递增，最后一片以 FF D9 结尾。
+
+    Split one JPEG into uplink IMAGE frame chunks: one task_id per image, seq counting up, the last chunk ends with FF D9.
+    Interleave the chunks between audio frames (see ImageSender) so they never hold up the audio.
+    """
+    if not (jpeg.startswith(b"\xff\xd8") and jpeg.endswith(b"\xff\xd9")):
+        raise ValueError("not a complete JPEG")
+    tid = f"img{image_no % 100000:05d}"
+    return [(tid, k, jpeg[i:i + IMAGE_CHUNK]) for k, i in enumerate(range(0, len(jpeg), IMAGE_CHUNK))]
+
+
+def to_jpeg(data: bytes, max_side: int = 448, quality: int = 70) -> bytes:
+    """缩到长边 448 px、质量 70（约 20–40 KB）；需要 Pillow / resize to 448 px, quality 70 (needs Pillow)."""
+    import io
+    from PIL import Image
+    im = Image.open(io.BytesIO(data)).convert("RGB")
+    im.thumbnail((max_side, max_side))
+    out = io.BytesIO()
+    im.save(out, "JPEG", quality=quality)
+    return out.getvalue()
+
+
+class ImageSender:
+    """排队要发的图，每推一帧音频就顺带发 2 片，不会一口气挤住上行。
+
+    Queues images and sends two chunks after each audio frame, so images never block the uplink audio.
+    """
+
+    def __init__(self, conn: "Connection"):
+        self.conn = conn
+        self.pending: list[tuple[str, int, bytes]] = []
+        self.n = 0
+        self.lock = threading.Lock()
+
+    def add(self, jpeg: bytes):
+        with self.lock:
+            self.n += 1
+            self.pending = image_chunks(jpeg, self.n)      # 只留最新一张 / keep only the newest image
+
+    def pump(self, per_frame: int = 2):
+        with self.lock:
+            out, self.pending = self.pending[:per_frame], self.pending[per_frame:]
+        for tid, seq, chunk in out:
+            self.conn.send(IMAGE, chunk, tid, seq)
+
+
+class CameraInput:
+    """摄像头，每 interval 秒取一张 JPEG；需要 opencv-python / webcam, one JPEG every interval seconds (needs opencv-python)."""
+
+    def __init__(self, index: int = 0, interval: float = 1.0):
+        import cv2
+        self.cv2, self.cap, self.interval, self.t = cv2, cv2.VideoCapture(index), interval, 0.0
+
+    def poll(self) -> bytes | None:
+        if time.monotonic() - self.t < self.interval:
+            return None
+        self.t = time.monotonic()
+        ok, img = self.cap.read()
+        if not ok:
+            return None
+        h, w = img.shape[:2]
+        k = 448 / max(h, w)
+        if k < 1:
+            img = self.cv2.resize(img, (int(w * k), int(h * k)))
+        ok, buf = self.cv2.imencode(".jpg", img, [self.cv2.IMWRITE_JPEG_QUALITY, 70])
+        return buf.tobytes() if ok else None
+
+    def close(self):
+        self.cap.release()
+
+
 # ---------------------------------------------------------------- audio in / out
 class WavInput:
     """用 wav 文件模拟麦克风：先静音，再按实时速度放文件，之后一直给静音。
